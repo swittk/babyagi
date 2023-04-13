@@ -7,7 +7,6 @@ from typing import Dict, List
 import importlib
 
 import openai
-import pinecone
 import hnsqlite
 from llama_cpp import Llama
 
@@ -42,6 +41,7 @@ PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT", "")
 
 # If pinecone is defined, setup pinecone, otherwise setup hnsqlite instead
 if PINECONE_API_KEY:
+    import pinecone
     assert (
         PINECONE_ENVIRONMENT
     ), "PINECONE_API_KEY is defined but PINECONE_ENVIRONMENT environment variable is missing from .env"
@@ -265,7 +265,8 @@ def prioritization_agent(this_task_id: int):
     task_list = deque()
     for task_string in new_tasks:
         task_parts = task_string.strip().split(".", 1)
-        if len(task_parts) == 2:
+        # If there are two parts, and the task id part is a number, then add the task to our task list.
+        if len(task_parts) == 2 and task_parts[0].strip().isnumeric():
             task_id = task_parts[0].strip()
             task_name = task_parts[1].strip()
             task_list.append({"task_id": task_id, "task_name": task_name})
