@@ -13,3 +13,6 @@ venv/
 
 models
 llama/
+
+hnsqlite.sqlite
+index_*.hnsw

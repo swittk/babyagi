@@ -8,6 +8,9 @@ import importlib
 
 import openai
 import pinecone
+import hnsqlite
+from llama_cpp import Llama
+
 from dotenv import load_dotenv
 
 # Load default environment variables (.env)
@@ -17,7 +20,7 @@ load_dotenv()
 
 # API Keys
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-assert OPENAI_API_KEY, "OPENAI_API_KEY environment variable is missing from .env"
+# assert OPENAI_API_KEY, "OPENAI_API_KEY environment variable is missing from .env"
 
 OPENAI_API_MODEL = os.getenv("OPENAI_API_MODEL", "gpt-3.5-turbo")
 assert OPENAI_API_MODEL, "OPENAI_API_MODEL environment variable is missing from .env"
@@ -29,17 +32,77 @@ if "gpt-4" in OPENAI_API_MODEL.lower():
         + "\033[0m\033[0m"
     )
 
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "")
-assert PINECONE_API_KEY, "PINECONE_API_KEY environment variable is missing from .env"
-
-PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT", "")
-assert (
-    PINECONE_ENVIRONMENT
-), "PINECONE_ENVIRONMENT environment variable is missing from .env"
-
 # Table config
 YOUR_TABLE_NAME = os.getenv("TABLE_NAME", "")
 assert YOUR_TABLE_NAME, "TABLE_NAME environment variable is missing from .env"
+
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "")
+# assert PINECONE_API_KEY, "PINECONE_API_KEY environment variable is missing from .env"
+PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT", "")
+
+# If pinecone is defined, setup pinecone, otherwise setup hnsqlite instead
+if PINECONE_API_KEY:
+    assert (
+        PINECONE_ENVIRONMENT
+    ), "PINECONE_API_KEY is defined but PINECONE_ENVIRONMENT environment variable is missing from .env"
+    pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_ENVIRONMENT)
+    # Create Pinecone index
+    table_name = YOUR_TABLE_NAME
+    dimension = 1536
+    metric = "cosine"
+    pod_type = "p1"
+    if table_name not in pinecone.list_indexes():
+        pinecone.create_index(
+            table_name, dimension=dimension, metric=metric, pod_type=pod_type
+        )
+    # Connect to the index
+    index = pinecone.Index(table_name)
+    def query_task_list(query_embedding: List[float], n: int) -> List[str]:
+        results = index.query(query_embedding, top_k=n, include_metadata=True, namespace=OBJECTIVE)
+        # print("***** RESULTS *****")
+        # print(results)
+        sorted_results = sorted(results.matches, key=lambda x: x.score, reverse=True)
+        return [(str(item.metadata["task"])) for item in sorted_results]
+    def insert_task_list(result_id: str, task_name: str, vector: List[float], result: str):
+        index.upsert(
+            [(result_id, vector, {"task": task_name, "result": result})],
+            namespace=OBJECTIVE
+        )
+
+else:
+    # Create hnsqlite collection and use it instead if pinecone is not defined.
+    print("Using HNSQLite for vector database")
+    # Thanks to @wskish for the example on how to use hnsqlite
+    collection = hnsqlite.Collection(YOUR_TABLE_NAME, dimension=5120)
+    def query_task_list(query_embedding: List[float], n: int) -> List[str]:
+        try:
+            results = collection.search(query_embedding, k=n)   # results returned sorted by distance
+        except:
+            return []
+        print("***** RESULTS *****")
+        task_results = [(str(item.metadata['task'])) for item in results]
+        print(task_results)
+        return task_results
+    def insert_task_list(result_id: str, task_name: str, vector: List[float], result: str):
+        emb = hnsqlite.Embedding(doc_ids  = result_id, 
+                                  vector   = vector,
+                                  text     = result,                              
+                                  metadata = {"task":task_name,"result":result})
+        collection.add_embedding(emb)
+
+
+if OPENAI_API_KEY:
+    # If OpenAI API key is defined, use ADA embeddings
+    def get_embedding(text: str) -> List[float]:
+        return get_ada_embedding(text)
+else:
+    # Use Llama embeddings instead.
+    def get_embedding(text: str) -> List[float]:
+        text = text.replace("\n", " ")
+        res = llm.embed(input=text)
+        print("embedding length is "+str(len(res)))
+        return res
+
 
 # Goal configuation
 OBJECTIVE = os.getenv("OBJECTIVE", "")
@@ -93,28 +156,19 @@ if "gpt-4" in OPENAI_API_MODEL.lower():
         + "\033[0m\033[0m"
     )
 
+LLAMA_MODEL_PATH = os.getenv("LLAMA_MODEL_PATH", "")
+
+if LLAMA_MODEL_PATH and OPENAI_API_MODEL.startswith("llama"):
+    llm = Llama(model_path=LLAMA_MODEL_PATH, embedding=True)
+
 # Print OBJECTIVE
 print("\033[94m\033[1m" + "\n*****OBJECTIVE*****\n" + "\033[0m\033[0m")
 print(f"{OBJECTIVE}")
 
 print("\033[93m\033[1m" + "\nInitial task:" + "\033[0m\033[0m" + f" {INITIAL_TASK}")
 
-# Configure OpenAI and Pinecone
+# Configure OpenAI
 openai.api_key = OPENAI_API_KEY
-pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_ENVIRONMENT)
-
-# Create Pinecone index
-table_name = YOUR_TABLE_NAME
-dimension = 1536
-metric = "cosine"
-pod_type = "p1"
-if table_name not in pinecone.list_indexes():
-    pinecone.create_index(
-        table_name, dimension=dimension, metric=metric, pod_type=pod_type
-    )
-
-# Connect to the index
-index = pinecone.Index(table_name)
 
 # Task list
 task_list = deque([])
@@ -136,14 +190,18 @@ def openai_call(
     model: str = OPENAI_API_MODEL,
     temperature: float = 0.5,
     max_tokens: int = 100,
-):
+) -> str:
     while True:
         try:
             if model.startswith("llama"):
                 # Spawn a subprocess to run llama.cpp
-                cmd = ["llama/main", "-p", prompt]
-                result = subprocess.run(cmd, shell=True, stderr=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True)
-                return result.stdout.strip()
+                # cmd = ["llama/main", "-p", prompt]
+                output = llm(prompt=prompt)
+                toret = output["choices"][0]["text"].strip()
+                print("LLaMA OUTPUT : "+toret)
+                return toret
+                # result = subprocess.run(cmd, shell=True, stderr=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True)
+                # return result.stdout.strip()
             elif not model.startswith("gpt-"):
                 # Use completion API
                 response = openai.Completion.create(
@@ -248,12 +306,13 @@ def context_agent(query: str, n: int):
         list: A list of tasks as context for the given query, sorted by relevance.
 
     """
-    query_embedding = get_ada_embedding(query)
-    results = index.query(query_embedding, top_k=n, include_metadata=True, namespace=OBJECTIVE)
+    query_embedding = get_embedding(query)
+    sorted_results = query_task_list(query_embedding, n)
+    # results = index.query(query_embedding, top_k=n, include_metadata=True, namespace=OBJECTIVE)
     # print("***** RESULTS *****")
     # print(results)
-    sorted_results = sorted(results.matches, key=lambda x: x.score, reverse=True)
-    return [(str(item.metadata["task"])) for item in sorted_results]
+    # sorted_results = sorted(results.matches, key=lambda x: x.score, reverse=True)
+    return sorted_results
 
 
 # Add the first task
@@ -280,18 +339,20 @@ while True:
         print("\033[93m\033[1m" + "\n*****TASK RESULT*****\n" + "\033[0m\033[0m")
         print(result)
 
-        # Step 2: Enrich result and store in Pinecone
+        # Step 2: Enrich result and store in Vector Database
         enriched_result = {
             "data": result
         }  # This is where you should enrich the result if needed
         result_id = f"result_{task['task_id']}"
-        vector = get_ada_embedding(
+        vector = get_embedding(
             enriched_result["data"]
         )  # get vector of the actual result extracted from the dictionary
-        index.upsert(
-            [(result_id, vector, {"task": task["task_name"], "result": result})],
-	    namespace=OBJECTIVE
-        )
+        task_name = task["task_name"]
+        insert_task_list(result_id=result_id, vector=vector, task_name=task_name, result=result)
+        # index.upsert(
+        #     [(result_id, vector, {"task": task["task_name"], "result": result})],
+	    # namespace=OBJECTIVE
+        # )
 
         # Step 3: Create new tasks and reprioritize task list
         new_tasks = task_creation_agent(
